@@ -1112,6 +1112,28 @@ impl HarnessRelay {
 }
 
 impl HarnessRelay {
+    /// Publish an event only until the relay has returned its verdict, then
+    /// gracefully close the relay connection.
+    ///
+    /// This keeps the close frame behind an acknowledged final event. In
+    /// particular, the harness uses it for offline presence: the relay
+    /// authenticates an EVENT when its handler runs, so closing immediately
+    /// after a fire-and-forget write can revoke the session first.
+    pub async fn publish_event_acked_then_shutdown(
+        self,
+        event: Event,
+        ack_timeout: Duration,
+    ) -> Result<PublishAck, RelayError> {
+        let publisher = self.event_publisher();
+        let result =
+            match tokio::time::timeout(ack_timeout, publisher.publish_event_acked(event)).await {
+                Ok(result) => result,
+                Err(_) => Err(RelayError::Http("acknowledged publish timed out".into())),
+            };
+        self.shutdown().await;
+        result
+    }
+
     /// Graceful async shutdown — sends Shutdown command and waits up to 5s for
     /// the background task to finish. Use this from async contexts instead of
     /// relying on `Drop` (which aborts immediately).
@@ -6653,6 +6675,91 @@ mod tests {
         )
         .sign_with_keys(keys)
         .expect("sign presence event")
+    }
+
+    /// The harness must not close its socket until the relay has processed its
+    /// final presence update. This drives the same `HarnessRelay` shutdown
+    /// method `run_harness` uses, rather than testing the publisher helper in
+    /// isolation.
+    #[tokio::test]
+    async fn acknowledged_publish_shuts_down_only_after_the_relay_verdict() {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+        let (published_tx, mut published_rx) = mpsc::channel(1);
+        let (verdict_tx, mut verdict_rx) = mpsc::channel(1);
+        let (closed_tx, mut closed_rx) = oneshot::channel();
+        let bg_handle = tokio::spawn(async move {
+            let mut closed_tx = Some(closed_tx);
+            let RelayCommand::PublishEventAcked { event, ack } =
+                cmd_rx.recv().await.expect("receive acknowledged publish")
+            else {
+                panic!("shutdown must publish through the acknowledged command");
+            };
+            published_tx.send(*event).await.expect("record final event");
+
+            tokio::select! {
+                Some(verdict) = verdict_rx.recv() => {
+                    let _ = ack.send(verdict);
+                }
+                command = cmd_rx.recv() => {
+                    assert!(matches!(command, Some(RelayCommand::Shutdown)), "only shutdown may follow the final event");
+                    let _ = closed_tx.take().expect("close signal remains available").send(());
+                    return;
+                }
+            }
+
+            assert!(matches!(cmd_rx.recv().await, Some(RelayCommand::Shutdown)));
+            let _ = closed_tx
+                .take()
+                .expect("close signal remains available")
+                .send(());
+        });
+        let (_event_tx, event_rx) = mpsc::channel(1);
+        let (_observer_tx, observer_rx) = mpsc::channel(1);
+        let relay = HarnessRelay {
+            event_rx,
+            observer_control_rx: Some(observer_rx),
+            cmd_tx,
+            http: reqwest::Client::new(),
+            relay_url: "ws://relay.test".into(),
+            keys: Keys::generate(),
+            auth_tag: None,
+            bg_handle: Some(bg_handle),
+        };
+        let keys = Keys::generate();
+        let offline = make_presence_event(&keys, "offline");
+        let shutdown = tokio::spawn(
+            relay.publish_event_acked_then_shutdown(offline.clone(), Duration::from_secs(1)),
+        );
+
+        assert_eq!(
+            published_rx.recv().await.expect("final event was sent").id,
+            offline.id
+        );
+        assert!(
+            matches!(
+                closed_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ),
+            "the socket must remain open before the relay's OK"
+        );
+
+        verdict_tx
+            .send(PublishAck {
+                accepted: true,
+                message: String::new(),
+            })
+            .await
+            .expect("deliver relay OK");
+        assert!(
+            shutdown
+                .await
+                .expect("join shutdown")
+                .expect("relay accepted event")
+                .accepted
+        );
+        closed_rx
+            .await
+            .expect("socket closes after the relay verdict");
     }
 
     async fn deliver_ok(
